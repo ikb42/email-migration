@@ -9,7 +9,9 @@
   "author": "Gabriel de Carvalho Souza",
   "license": "ISC",
   "dependencies": {
-    "imapflow": "^1.0.67",
-    "logger": "^0.0.1"
+    "async-cleanup": "^1.0.0",
+    "bunyan": "^1.8.15",
+    "imapflow": "^1.0.147",
+    "mongoose": "^8.0.3"
   }
 }
