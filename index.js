@@ -3,13 +3,13 @@ const Transferred = require('./data')
 const transferData = require('./transferEmails.json')
 
 const logger = require('./logger');
-const { connectClient, findMailboxOrCreateIt } = require('./connectClient');
+const { Client, findMailboxOrCreateIt } = require('./Client');
 const { wait } = require('./utils');
 
 
-function downloadMessageAndUpload(msg, mailboxTo, fromClient, toClient) {
+function downloadMessageAndUpload(msg, toMailbox, fromClient, toClient) {
 
-  return fromClient
+  return fromClient.imap
     .download(msg.uid, undefined, { uid: true })
     .then(({ content: contentStream }) => new Promise((resolve, reject) => {
       const buffers = []
@@ -19,14 +19,12 @@ function downloadMessageAndUpload(msg, mailboxTo, fromClient, toClient) {
       contentStream.on('end', async () => {
         try {
           const flags = [...msg.flags].filter(flag => flag !== '\\RECEIPTCHECKED')
-          let added = await toClient.append(mailboxTo.path, Buffer.concat(buffers), flags, msg.date)
+          let added = await toClient.imap.append(toMailbox.path, Buffer.concat(buffers), flags, msg.date)
           resolve(added)
         }
         catch (err) {
-          logger.error({ err, message: msg }, 'downloadMessageAndUpload - toClient.append - error')
-          logger.warn(`toClient.usable `, toClient.usable)
-          logger.warn(`fromClient.usable `, fromClient.usable)
-          reject(err)
+          logger.error({ err, message: msg, 'toClient_usable': toClient.imap.usable, 'fromClient_usable': fromClient.imap.usable }, `downloadMessageAndUpload for ${fromClient.label} - toClient.append - error`)
+          reject({'toClient_usable': toClient.imap.usable, 'fromClient_usable': fromClient.imap.usable})
         }
       })
 
@@ -34,35 +32,49 @@ function downloadMessageAndUpload(msg, mailboxTo, fromClient, toClient) {
         // logger.warn("close................................. ", msg.date)
       })
 
-      contentStream.on('error', (err) => reject(err))
+      contentStream.on('error', (err) => {
+        logger.error(err, `downloadMessageAndUpload for ${oClient.label} - error`)
+        reject(err)
+      })
     }))
 }
 
 async function getAndUpload(itr, state, transferred, toMailbox, fromClient, toClient) {
+  let noticeTime = Date.now()
   let nextMsg = itr.next()
+
+  const log = logger.child({ fromEmail: state.fromEmail })
+
   while (nextMsg && nextMsg.value) {
     if (closing) break
-
+    
+    const [idx, message] = nextMsg.value
     try {
       state.running += 1
-      const [idx, message] = nextMsg.value
-
       const msgAdded = await downloadMessageAndUpload(message, toMailbox, fromClient, toClient)
-
+      
       state.messagesUploadedCount += 1
       transferred.msgIds.push({ sourceUid: message.uid, destUid: msgAdded.uid })
 
-      if (state.messagesUploadedCount % 10 === 0) {
+      if (state.messagesUploadedCount % 10 === 0 || (Date.now() - noticeTime) > (1000 * 60)) {
         transferred.saveDoc()
-        if (state.messagesUploadedCount % 100 === 0) {
-          logger.info(`${state.fromEmail}: Messages uploaded: ${state.messagesUploadedCount} of ${state.total}  ${state.messagesErrorCount ? '(errors: ' + state.messagesErrorCount + ')' : ''}`)
+        if (state.messagesUploadedCount % 100 === 0 || (Date.now() - noticeTime) > (1000 * 60)) {
+          log.info(`Messages uploaded: ${state.messagesUploadedCount} of ${state.total}  ${state.messagesErrorCount ? '(errors: ' + state.messagesErrorCount + ')' : ''}`)
+          noticeTime = Date.now()
         }
       }
     }
     catch (er) {
       state.messagesErrorCount += 1
       state.messagesToRetry.push(message)
-      logger.error(er, `getAndUpload - error - errorCount: ${state.messagesErrorCount}  (uploaded: ${state.messagesUploadedCount} of ${state.total})`)
+      log.error(er, `getAndUpload - error - errorCount: ${state.messagesErrorCount}  (uploaded: ${state.messagesUploadedCount} of ${state.total})`)
+
+      if (er.fromClient_usable !== true) {
+        await fromClient.reCreateAndConnectClient()
+      }
+      if (er.toClient_usable !== true) {
+        await toClient.reCreateAndConnectClient()
+      }
     }
     finally {
       state.running -= 1
@@ -94,19 +106,21 @@ async function process(acc) {
   let fromClient, toClient
   try {
     log.debug(`Creating and connecting clients`)
-    fromClient = await connectClient(transferData.providers[fromAcc.provider], fromAcc, 'from')
-    toClient = await connectClient(transferData.providers[toAcc.provider], toAcc, 'to')
+    fromClient = new Client(transferData.providers[fromAcc.provider], fromAcc, 'from')
+    await fromClient.connectClient()
+    toClient = new Client(transferData.providers[toAcc.provider], toAcc, 'to')
+    await toClient.connectClient()
 
-    const fromQuota = await fromClient.getQuota()
-    const toQuota = await toClient.getQuota()
+    const fromQuota = await fromClient.imap.getQuota()
+    const toQuota = await toClient.imap.getQuota()
 
     if (fromQuota && toQuota && fromQuota.storage.used > toQuota.storage.available) {
       throw new Error('Disk quota used in the From email is bigger than the To email')
     }
 
     // Get all emails mailboxes
-    const mailboxesOfFromEmail = await fromClient.list()
-    const mailboxesOfToEmail = await toClient.list()
+    const mailboxesOfFromEmail = await fromClient.imap.list()
+    const mailboxesOfToEmail = await toClient.imap.list()
 
     // Go through each mailbox of the main email 
     log.debug('Going through mailboxes (skips flagged *Junk / *Trash)')
@@ -127,28 +141,48 @@ async function process(acc) {
         continue mailboxLoop
       }
 
-      try {
-        const toMailbox = await findMailboxOrCreateIt(mailboxesOfToEmail, fromMailbox, toClient)
 
+      let toMailbox
+      try {
+        toMailbox = await findMailboxOrCreateIt(mailboxesOfToEmail, fromMailbox, toClient.imap)
+      } 
+      catch (error) {
+        log.error(error, 'Error creating new mailbox: ', fromMailbox.path)
+      }
+
+      if (toMailbox) {
         let fromMailboxLock
         let toMailboxLock
 
         try {
-          fromMailboxLock = await fromClient.getMailboxLock(fromMailbox.path)
-          toMailboxLock = await toClient.getMailboxLock(toMailbox.path)
+          fromMailboxLock = await fromClient.imap.getMailboxLock(fromMailbox.path)
+          toMailboxLock = await toClient.imap.getMailboxLock(toMailbox.path)
+        }
+        catch (error) {
+          log.error(error, 'Error getting lock for mailboxes: ', fromMailbox.path)
+        }
 
-          const { messages: numOfMessages } = await fromClient.status(fromMailbox.path, { messages: true })
+        if (fromMailboxLock) {
+          const { messages: numOfMessages } = await fromClient.imap.status(fromMailbox.path, { messages: true })
           mailbox.numOfMessages = numOfMessages
 
-          let messagesUploadedCount = 0
-
           log.debug(`Getting ${numOfMessages} messages from mailbox: ${fromMailbox.pathAsListed}`)
+
+          const state = {
+            fromEmail: fromAcc.email,
+            total: 0,
+            running: 0,
+            messagesUploadedCount: 0,
+            messagesErrorCount: 0,
+            messagesToRetry: [],
+            attempts: 0
+          }
 
           try {
             const messages = []
 
             // Getting messages from "from" mailbox
-            for await (let msg of fromClient.fetch(`1:*`, { uid: true, internalDate: true, flags: true })) {
+            for await (let msg of fromClient.imap.fetch(`1:*`, { uid: true, internalDate: true, flags: true })) {
               messages.push({
                 uid: msg.uid,
                 date: msg.internalDate,
@@ -157,28 +191,20 @@ async function process(acc) {
             }
 
             const msgTotal = messages.length
-            log.debug(`Messages to upload from ${fromMailbox.pathAsListed} - before check: `, msgTotal)
-
             const msgsToProcess = []
+            let alreadyUploaded = 0
             // Check already imported
             for (let [idx, msg] of messages.entries()) {
               const has = transferred.msgIds.find(o => o.sourceUid === msg.uid)
               if (!has) msgsToProcess.push(msg)
+              else alreadyUploaded += 1
             }
 
             mailbox.msgsToProcess = msgsToProcess.length
+            mailbox.alreadyUploaded = alreadyUploaded
+            state.total = msgsToProcess.length
 
-            log.debug(`Messages to upload from ${fromMailbox.pathAsListed} - after check: ${msgsToProcess.length}  (${msgTotal - msgsToProcess.length} - db has: ${transferred.msgIds.length})`)
-
-            const state = {
-              fromEmail: fromAcc.email,
-              total: msgsToProcess.length,
-              running: 0,
-              messagesUploadedCount: 0,
-              messagesErrorCount: 0,
-              messagesToRetry: [],
-              attempts: 0
-            }
+            log.debug(`Messages to upload from ${fromMailbox.pathAsListed}: ${msgsToProcess.length}  (total ${msgTotal} & db has: ${alreadyUploaded})`)
 
             let msgsToProcessNow = msgsToProcess
 
@@ -190,7 +216,7 @@ async function process(acc) {
 
               promises.push(getAndUpload(itr, state, transferred, toMailbox, fromClient, toClient))
               promises.push(getAndUpload(itr, state, transferred, toMailbox, fromClient, toClient))
-
+              
               try {
                 await Promise.allSettled(promises)
                 
@@ -220,34 +246,25 @@ async function process(acc) {
             fromMailbox: fromMailbox.path,
             toMailbox: toMailbox.path,
             totalMessages: numOfMessages,
-            messagesUploaded: messagesUploadedCount
+            messagesUploaded: state.messagesUploadedCount,
+            previouslyUploaded: mailbox.alreadyUploaded
           })
-
-          if (messagesUploadedCount !== numOfMessages) {
-            log.error('Messages uploaded doen\'t matches number of total messages of', fromMailbox.path)
-          }
-
-        } 
-        catch (error) {
-          log.error(error, 'Error getting lock for mailboxes: ', fromMailbox.path)
-        } 
-        finally {
-          if (fromMailboxLock) fromMailboxLock.release()
-          if (toMailboxLock) toMailboxLock.release()
         }
 
-      } 
-      catch (error) {
-        log.error(error, 'Error creating new mailbox: ', fromMailbox.path)
+        if (fromMailboxLock) fromMailboxLock.release()
+        if (toMailboxLock) toMailboxLock.release()
       }
+      
     }
+
+    log.info('Migration complete')
   }
   catch (error) {
     log.error(error, `Process error for ${fromAcc.email}`)
   }
   finally {
-    if (fromClient && fromClient.authenticated) fromClient.logout()
-    if (toClient && toClient.authenticated) toClient.logout()
+    if (fromClient && fromClient.imap.authenticated) fromClient.imap.logout()
+    if (toClient && toClient.imap.authenticated) toClient.imap.logout()
   }
 
   const idx = transferring.find((t => t.email === fromAcc.email))
@@ -263,6 +280,7 @@ const main = async () => {
   const promises = []
 
   for (let [index, acc] of Object.entries(transferData.accounts)) {
+    if (acc.include === false) continue
     promises.push( process(acc) )
   }
 
@@ -278,7 +296,7 @@ const main = async () => {
       return `
               ${mailboxPrevString}
               - Mailbox from -> to: ${mailbox.fromMailbox}  ->  ${mailbox.toMailbox}
-                Messages uploaded: ${mailbox.messagesUploaded}  of  ${mailbox.totalMessages}
+                Messages uploaded: ${mailbox.messagesUploaded}  (prev. uploaded ${mailbox.previouslyUploaded})  of  ${mailbox.totalMessages}
             `
     }, '').trim()
       }
